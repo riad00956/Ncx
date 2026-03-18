@@ -3,3 +3,4 @@ telethon
 aiosqlite
 Flask
 waitress
+aiohttp
