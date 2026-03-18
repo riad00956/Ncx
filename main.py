@@ -1,9 +1,9 @@
 import os
 import asyncio
-import zipfile
+import json
 from threading import Thread
 
-import aiosqlite
+import aiohttp
 from flask import Flask
 from waitress import serve
 from telebot.async_telebot import AsyncTeleBot
@@ -14,8 +14,11 @@ from telethon.sessions import StringSession
 # ---------- Configuration ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
-DB_PATH = "data.db"
 CREDIT = "「 Prime Xyron 」👨‍💻"
+
+# External Database API Configuration
+API_BASE_URL = "https://phpbot.top/api/external/"
+DB_ID = "db_9J0TaLB4XlvNp10MGtHbcrc8uKSdfc1o"
 
 bot = AsyncTeleBot(BOT_TOKEN)
 
@@ -28,40 +31,84 @@ state_lock = asyncio.Lock()
 clients_lock = asyncio.Lock()
 reply_lock = asyncio.Lock()
 
-# ---------- Database helpers (async) ----------
+# ---------- API Helpers ----------
+async def api_request(action: str, method: str = "GET", data: dict = None):
+    """Make a request to the external database API."""
+    url = API_BASE_URL
+    params = {"db": DB_ID}
+    if action:
+        params["action"] = action
+
+    async with aiohttp.ClientSession() as session:
+        if method == "GET":
+            async with session.get(url, params=params, json=data) as resp:
+                return await resp.json()
+        elif method == "POST":
+            async with session.post(url, params=params, json=data) as resp:
+                return await resp.json()
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+
+# ---------- Database helpers (via API) ----------
 async def db_init():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            api_id INTEGER,
-            api_hash TEXT,
-            string_session TEXT,
-            custom_reply TEXT DEFAULT "I'm currently offline.",
-            is_active INTEGER DEFAULT 0,
-            is_enabled INTEGER DEFAULT 1
-        )''')
-        await db.commit()
+    """Test API connection."""
+    try:
+        await api_request("ping", method="GET")
+    except Exception as e:
+        print(f"Database API connection failed: {e}")
 
 async def db_get_user(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT api_id, api_hash, string_session, custom_reply, is_enabled FROM users WHERE user_id = ?",
-            (user_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-    return row
+    """Retrieve user data from API."""
+    try:
+        resp = await api_request("get_user", method="GET", data={"user_id": user_id})
+        if resp.get("status") == "success":
+            data = resp.get("data")
+            if data:
+                # Return tuple in same order as before: (api_id, api_hash, string_session, custom_reply, is_enabled)
+                return (
+                    data.get("api_id"),
+                    data.get("api_hash"),
+                    data.get("string_session"),
+                    data.get("custom_reply", "I'm currently offline."),
+                    data.get("is_enabled", 1)
+                )
+        return None
+    except Exception as e:
+        print(f"db_get_user error: {e}")
+        return None
 
 async def db_update_user(user_id: int, **kwargs):
-    sets = ", ".join(f"{k} = ?" for k in kwargs)
-    values = list(kwargs.values()) + [user_id]
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(f"UPDATE users SET {sets} WHERE user_id = ?", values)
-        await db.commit()
+    """Update user data via API."""
+    data = kwargs.copy()
+    data["user_id"] = user_id
+    try:
+        resp = await api_request("update_user", method="POST", data=data)
+        return resp.get("status") == "success"
+    except Exception as e:
+        print(f"db_update_user error: {e}")
+        return False
 
 async def db_insert_user(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-        await db.commit()
+    """Insert a new user via API."""
+    try:
+        resp = await api_request("insert_user", method="POST", data={"user_id": user_id})
+        return resp.get("status") == "success"
+    except Exception as e:
+        print(f"db_insert_user error: {e}")
+        return False
+
+async def db_get_active_users():
+    """Retrieve all active users (is_active=1) from API."""
+    try:
+        resp = await api_request("get_active_users", method="GET")
+        if resp.get("status") == "success":
+            users = resp.get("data", [])
+            # Each user should be a dict with keys: user_id, api_id, api_hash, string_session
+            return [(u["user_id"], u["api_id"], u["api_hash"], u["string_session"]) for u in users]
+        return []
+    except Exception as e:
+        print(f"db_get_active_users error: {e}")
+        return []
 
 # ---------- User Listener (ghost mode) ----------
 async def user_listener(uid: int, api_id: int, api_hash: str, session_str: str):
@@ -109,7 +156,7 @@ async def user_listener(uid: int, api_id: int, api_hash: str, session_str: str):
                     reply_tracking[uid] = reply_tracking.get(uid, 0) + 1
                     current_call = reply_tracking[uid]
 
-                await asyncio.sleep(5)
+                await asyncio.sleep(15)
 
                 async with reply_lock:
                     # If no new reply came during the sleep, go back offline
@@ -138,9 +185,10 @@ async def cmd_start(message):
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add("⚙️ Settings", "✏️ Set Reply", "📊 Status")
     text = (
-        "👻 𝙿𝚑𝚊𝚗𝚝𝚘𝚖 𝚁𝚎𝚙𝚕𝚢\n\n"
+        "👻 Phantom Reply\n\n"
         "Welcome to your Telegram shadow.\n"
         "When you are offline, I automatically reply to messages for you.\n\n"
+        "I never reply when you are online.\n\n"
         "⚡ Smart Presence Detection\n"
         "💬 Custom Auto Reply\n"
         "🔐 Secure Login System\n\n"
@@ -163,7 +211,7 @@ async def settings(message):
         markup.add(InlineKeyboardButton("➕ Login Account", callback_data="login"))
 
     text = (
-        "⚙️ 𝚂𝚎𝚝𝚝𝚒𝚗𝚐𝚜 𝙿𝚊𝚗𝚎𝚕\n\n"
+        "⚙️ Settings Panel\n\n"
         f"Account Status : {status}\n\n"
         "If your account is not connected,\n"
         "please login using your Telegram API.\n\n"
@@ -180,10 +228,10 @@ async def callback_handler(call):
         async with state_lock:
             user_states[uid] = {"step": "api"}
         await bot.send_message(uid,
-            "🔑 𝙰𝙿𝙸 𝙰𝚞𝚝𝚑𝚎𝚗𝚝𝚒𝚌𝚊𝚝𝚒𝚘𝚗\n\n"
-            "Send your credentials in this format :\n\n"
+            "🔑 API Authentication\n\n"
+            "Send your credentials in this format:\n\n"
             "API_ID:API_HASH\n\n"
-            "Example :\n"
+            "Example:\n"
             "123456:abcd1234efgh5678\n\n"
             "⚠️ Never share your API with anyone."
         )
@@ -199,7 +247,7 @@ async def callback_handler(call):
             if uid in active_clients:
                 await active_clients[uid].disconnect()
         await bot.send_message(uid,
-            "🔴 𝚂𝚎𝚜𝚜𝚒𝚘𝚗 𝚁𝚎𝚖𝚘𝚟𝚎𝚍\n\nYour Telegram session has been cleared."
+            "🔴 Session Removed\n\nYour Telegram session has been cleared."
         )
     await bot.answer_callback_query(call.id)
 
@@ -214,6 +262,10 @@ async def login_flow(message):
     step = state["step"]
     text = message.text.strip()
 
+    # Ignore unknown steps (like wait_reply) – let other handlers process them
+    if step not in ("api", "phone", "otp", "2fa"):
+        return
+
     if step == "api" and ":" in text:
         api_id, api_hash = text.split(":", 1)
         async with state_lock:
@@ -223,9 +275,9 @@ async def login_flow(message):
                 "step": "phone"
             })
         await bot.send_message(uid,
-            "📱 𝙿𝚑𝚘𝚗𝚎 𝚅𝚎𝚛𝚒𝚏𝚒𝚌𝚊𝚝𝚒𝚘𝚗\n\n"
+            "📱 Phone Verification\n\n"
             "Send your Telegram phone number.\n\n"
-            "Example :\n"
+            "Example:\n"
             "+8801XXXXXXXXX\n\n"
             "OTP code will be sent to your Telegram."
         )
@@ -245,9 +297,9 @@ async def login_flow(message):
                     "client": client
                 })
             await bot.send_message(uid,
-                "📩 𝙾𝚃𝙿 𝙲𝚘𝚍𝚎\n\n"
+                "📩 OTP Code\n\n"
                 "Enter the login code you received.\n\n"
-                "Example :\n"
+                "Example:\n"
                 "1 2 3 4 5\n\n"
                 "⏳ Please enter it quickly before it expires."
             )
@@ -272,7 +324,7 @@ async def login_flow(message):
                 is_active=1
             )
             await bot.send_message(uid,
-                "✅ 𝙻𝚘𝚐𝚒𝚗 𝚂𝚞𝚌𝚌𝚎𝚜𝚜\n\n"
+                "✅ Login Success\n\n"
                 "Your Telegram account is now connected.\n\n"
                 "👻 Phantom Reply is now active."
             )
@@ -285,10 +337,9 @@ async def login_flow(message):
             async with state_lock:
                 user_states[uid]["step"] = "2fa"
             await bot.send_message(uid,
-                "🔐 𝟸𝙵𝙰 𝚂𝚎𝚌𝚞𝚛𝚒𝚝𝚢\n\n"
+                "🔐 2FA Security\n\n"
                 "Your account has Two-Step Verification enabled.\n\n"
-                "Please enter your password to continue.\n\n"
-                "নিরাপত্তার জন্য এটি প্রয়োজন."
+                "Please enter your password to continue."
             )
         except Exception as e:
             await bot.send_message(uid, f"❌ Error: {e}")
@@ -301,7 +352,7 @@ async def login_flow(message):
                 string_session=session_str,
                 is_active=1
             )
-            await bot.send_message(uid, "✅ 𝙻𝚘𝚐𝚒𝚗 𝚂𝚞𝚌𝚌𝚎𝚜𝚜")
+            await bot.send_message(uid, "✅ Login Success")
             asyncio.create_task(user_listener(
                 uid, state["api_id"], state["api_hash"], session_str
             ))
@@ -316,22 +367,24 @@ async def set_reply(message):
     async with state_lock:
         user_states[uid] = {"step": "wait_reply"}
     await bot.send_message(uid,
-        "✏️ 𝙲𝚞𝚜𝚝𝚘𝚖 𝙰𝚞𝚝𝚘 𝚁𝚎𝚙𝚕𝚢\n\n"
+        "✏️ Custom Auto Reply\n\n"
         "Send the message you want people to receive when you are offline.\n\n"
-        "Example :\n"
-        "I'm currently offline. I'll reply later.\n\n"
-        "✅"
+        "Example:\n"
+        "I'm currently offline. I'll reply later."
     )
 
 @bot.message_handler(func=lambda m: m.from_user.id in user_states and user_states[m.from_user.id]["step"] == "wait_reply")
 async def save_reply(message):
     uid = message.from_user.id
-    await db_update_user(uid, custom_reply=message.text)
-    await bot.send_message(uid,
-        "✅ 𝚁𝚎𝚙𝚕𝚢 𝚂𝚊𝚟𝚎𝚍\n\nYour auto-reply message has been updated successfully."
-    )
-    async with state_lock:
-        user_states.pop(uid, None)
+    try:
+        await db_update_user(uid, custom_reply=message.text)
+        await bot.send_message(uid,
+            "✅ Reply Saved\n\nYour auto-reply message has been updated successfully."
+        )
+    finally:
+        # Always remove the state, even if an error occurred
+        async with state_lock:
+            user_states.pop(uid, None)
 
 @bot.message_handler(func=lambda m: m.text == "📊 Status")
 async def status_check(message):
@@ -340,11 +393,11 @@ async def status_check(message):
     if row and row[2]:          # has session
         status = "Active" if row[4] == 1 else "Disabled"
         text = (
-            f"📊 𝙱𝚘𝚝 𝚂𝚝𝚊𝚝𝚞𝚜\n\n"
+            f"📊 Bot Status\n\n"
             f"Reply : {row[3]}\n\n"
             f"Listener : {status}\n\n"
             f"Mode : Smart Offline Only\n\n"
-            f"「 Prime Xyron 」👨‍💻"
+            f"I never reply when you are online."
         )
     else:
         text = "❌ Not connected."
@@ -354,12 +407,21 @@ async def status_check(message):
 async def admin_backup(message):
     if message.from_user.id != ADMIN_ID:
         return
-    with zipfile.ZipFile("backup.zip", 'w') as z:
-        if os.path.exists(DB_PATH):
-            z.write(DB_PATH)
-    with open("backup.zip", 'rb') as f:
-        await bot.send_document(message.chat.id, f, caption="📊 Admin Backup")
-    os.remove("backup.zip")
+    try:
+        resp = await api_request("get_all_users", method="GET")
+        if resp.get("status") == "success":
+            data = resp.get("data", [])
+            backup_content = json.dumps(data, indent=2)
+            # Send as file
+            await bot.send_document(
+                message.chat.id,
+                ("backup.json", backup_content),
+                caption="📊 Admin Backup (from API)"
+            )
+        else:
+            await bot.send_message(message.chat.id, "❌ Failed to fetch backup data.")
+    except Exception as e:
+        await bot.send_message(message.chat.id, f"❌ Backup error: {e}")
 
 # ---------- Flask Keep‑Alive ----------
 app = Flask(__name__)
@@ -376,11 +438,7 @@ def run_flask():
 async def on_startup():
     await db_init()
     # Restore active listeners from database
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT user_id, api_id, api_hash, string_session FROM users WHERE is_active = 1"
-        ) as cursor:
-            active_users = await cursor.fetchall()
+    active_users = await db_get_active_users()
     for uid, api_id, api_hash, session in active_users:
         if api_id and api_hash and session:
             asyncio.create_task(user_listener(uid, api_id, api_hash, session))
