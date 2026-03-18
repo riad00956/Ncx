@@ -1,6 +1,5 @@
 telebot
 telethon
-aiosqlite
 Flask
 waitress
 aiohttp
